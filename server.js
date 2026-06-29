@@ -70,6 +70,11 @@ app.post('/video', upload.fields([
 // Receives: video1, video2, video3 ... (field name controls order)
 // Returns:  JSON { url, filename } — video stored on disk, not returned as binary
 // Use /delete/:filename to clean up after downloading
+//
+// Transition behaviour (3 seconds):
+//   VIDEO — outgoing clip fades to black, incoming clip rises from black (xfade=fadeblack)
+//   AUDIO — each clip's audio is pre-faded at its boundary before the acrossfade chain,
+//           so both streams are near-zero throughout the black window → effective silence
 app.post('/merge', upload.any(), (req, res) => {
   const files = req.files.sort((a, b) => a.fieldname.localeCompare(b.fieldname))
 
@@ -79,7 +84,7 @@ app.post('/merge', upload.any(), (req, res) => {
 
   const filename = `lesson_${Date.now()}.mp4`
   const outPath = path.join(VIDEOS_DIR, filename)
-  const fadeDuration = 1
+  const fadeDuration = 3  // seconds — black window between clips
 
   try {
     // Get duration of each video
@@ -93,21 +98,58 @@ app.post('/merge', upload.any(), (req, res) => {
 
     const inputs = files.map(f => `-i ${f.path}`).join(' ')
 
-    // Build chained xfade + acrossfade filters
+    // ── Audio pre-processing ────────────────────────────────────────────────
+    // Every clip gets:
+    //   • afade=in  at the very start    (all clips except the first)
+    //   • afade=out at the very end      (all clips except the last)
+    //
+    // This drives both streams to near-zero at every transition boundary.
+    // acrossfade then overlaps two already-silent tails → the black window
+    // is perceptually silent even though no explicit mute filter is needed.
+    const audioPreFilters = files.map((_, i) => {
+      const duration = durations[i]
+      const parts = []
+
+      // Fade in from silence (skip for the very first clip)
+      if (i > 0) {
+        parts.push(`afade=t=in:st=0:d=${fadeDuration}`)
+      }
+
+      // Fade out to silence (skip for the very last clip)
+      if (i < files.length - 1) {
+        const fadeOutStart = Math.max(0, duration - fadeDuration).toFixed(3)
+        parts.push(`afade=t=out:st=${fadeOutStart}:d=${fadeDuration}`)
+      }
+
+      // anull is a no-op passthrough — keeps the label consistent when no fades needed
+      return `[${i}:a]${parts.length ? parts.join(',') : 'anull'}[ap${i}]`
+    })
+
+    // ── Build chained xfade (video) + acrossfade (audio) ───────────────────
     const vFilters = []
-    const aFilters = []
+    const aFilters = [...audioPreFilters]   // audio pre-filters go first in the graph
+
     let prevV = '0:v'
-    let prevA = '0:a'
+    let prevA = 'ap0'
     let cumulativeDuration = durations[0]
 
     for (let i = 1; i < files.length; i++) {
       const isLast = i === files.length - 1
       const vOut = isLast ? 'vout' : `v${i}`
       const aOut = isLast ? 'aout' : `a${i}`
+
+      // xfade offset = when the transition should START in the running timeline
       const offset = (cumulativeDuration - fadeDuration).toFixed(3)
 
-      vFilters.push(`[${prevV}][${i}:v]xfade=transition=fade:duration=${fadeDuration}:offset=${offset}[${vOut}]`)
-      aFilters.push(`[${prevA}][${i}:a]acrossfade=d=${fadeDuration}[${aOut}]`)
+      // VIDEO: fade outgoing clip to black, fade incoming clip in from black
+      vFilters.push(
+        `[${prevV}][${i}:v]xfade=transition=fadeblack:duration=${fadeDuration}:offset=${offset}[${vOut}]`
+      )
+
+      // AUDIO: overlap the two pre-faded tails — result is near-silent
+      aFilters.push(
+        `[${prevA}][ap${i}]acrossfade=d=${fadeDuration}[${aOut}]`
+      )
 
       prevV = vOut
       prevA = aOut
