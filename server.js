@@ -41,7 +41,7 @@ app.post('/video', upload.fields([
 
   try {
     const audioDuration = getDuration(audPath)
-    const totalDuration = audioDuration + 4 // 2s silence before + 2s silence after
+    const totalDuration = audioDuration + 2 // 2s silence before + 2s silence after
 
     // Ken Burns: starts normal, eases into breathing zoom after 3s
     const kenBurns =
