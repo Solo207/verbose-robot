@@ -19,14 +19,17 @@ app.post('/video', upload.fields([
   // - Stays centered on the image throughout
   // - d=100000 means enough frames to cover any audio length
   // - fps=25 is standard smooth playback
+  // - s=1200x674 (not 675 — libx264 requires height divisible by 2)
+  // - scale filter at end enforces even dimensions as a safety net
   const kenBurns = [
     "zoompan=",
     "z='min(zoom+0.0008,1.5)':",
     "x='iw/2-(iw/zoom/2)':",
     "y='ih/2-(ih/zoom/2)':",
     "d=100000:",
-    "s=1200x675:",
-    "fps=25"
+    "s=1200x674:",
+    "fps=25,",
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2"
   ].join('')
 
   const cmd = [
