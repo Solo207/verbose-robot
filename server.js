@@ -23,7 +23,7 @@ app.post('/video', upload.fields([
   // - scale filter at end enforces even dimensions as a safety net
   const kenBurns = [
     "zoompan=",
-    "z='1.02+0.02*sin(2*PI*n/200)':",
+   "z='1.02+0.02*sin(2*3.14159265*in/200)':",
     "x='iw/2-(iw/zoom/2)':",
     "y='ih/2-(ih/zoom/2)':",
     "d=100000:",
