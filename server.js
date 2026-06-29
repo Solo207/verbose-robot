@@ -8,9 +8,33 @@ const crypto   = require('crypto')
 // ─── constants ───────────────────────────────────────────────────────────────
 
 const VIDEOS_DIR     = '/app/videos'
-const FADE           = 0.5           // seconds per side → 2s total transition
+const FADE           = 0.5              // seconds per side → 2s total transition
 const MAX_FFMPEG_MS  = 5 * 60 * 1000   // 5-minute hard timeout per ffmpeg process
 const UPLOAD_LIMIT   = 200 * 1024 * 1024 // 200 MB per file
+
+// ─── quality settings ────────────────────────────────────────────────────────
+// Centralised so a single edit controls both /video and /merge.
+//
+//  CRF 18    → visually lossless for most content (was default 23)
+//  preset    → 'slow' squeezes ~15–20 % more quality out of the same CRF
+//              at the cost of extra encode time (was unset → 'medium')
+//  PROFILE   → 'high' unlocks 8×8 DCT and better inter-prediction
+//  LEVEL     → '4.1' supports up to 1080p60; safe for all modern players
+//  AUDIO_BR  → 192k AAC; audible improvement over 128k on music/voiceover
+//  OUT_W/H   → 1920×1080 output (was 1200×674)
+//  KB_W/KB_H → 960×540 intermediate for Ken Burns zoompan (was 600×337);
+//              zoompan CPU scales with pixel count, so half-res is kept as
+//              an optimisation — the final upscale is lossless in libx264.
+
+const CRF      = '18'
+const PRESET   = 'slow'
+const PROFILE  = 'high'
+const LEVEL    = '4.1'
+const AUDIO_BR = '192k'
+const OUT_W    = 1920
+const OUT_H    = 1080
+const KB_W     = OUT_W  / 2   // 960
+const KB_H     = OUT_H  / 2   // 540
 
 // ─── app setup ───────────────────────────────────────────────────────────────
 
@@ -44,9 +68,9 @@ function getDuration(filePath) {
 
 /**
  * Async ffmpeg wrapper.
- * - Accepts an args ARRAY → no shell, no injection surface (fix #1)
- * - Non-blocking: Node can serve other requests while ffmpeg runs (fix #8)
- * - Hard timeout via spawn option prevents runaway processes (fix #14)
+ * - Accepts an args ARRAY → no shell, no injection surface
+ * - Non-blocking: Node can serve other requests while ffmpeg runs
+ * - Hard timeout via spawn option prevents runaway processes
  * - Captures stderr so errors are readable
  */
 function ffmpeg(args) {
@@ -75,7 +99,7 @@ function cleanup(...paths) {
 // ─── /video ──────────────────────────────────────────────────────────────────
 //
 // Receives: image (PNG) + audio (MP3)
-// Returns:  MP4 binary (streamed, not buffered — fix #9)
+// Returns:  MP4 binary (streamed, not buffered)
 //
 // Timeline:
 //   0:00 ─── picture visible, NO audio (2 seconds silence)
@@ -83,42 +107,41 @@ function cleanup(...paths) {
 //   END-2 ── audio fades to silence
 //   END ──── picture still visible, NO audio (2 more seconds)
 //
-// Ken Burns optimisation (fix #10):
-//   zoompan runs at 600×337 (half the output size) then upscales.
-//   This cuts zoompan CPU cost by ~4× with negligible quality loss,
-//   since the output encoder smooths the upscale.
-//   Hardware encoding alternative (if available):
-//     replace '-c:v','libx264' with '-c:v','h264_nvenc' (NVIDIA)
-//                                 or '-c:v','h264_videotoolbox' (Apple)
+// Ken Burns optimisation:
+//   zoompan runs at KB_W×KB_H (half the output size) then upscales to OUT_W×OUT_H.
+//   This cuts zoompan CPU cost by ~4× with negligible quality loss because
+//   libx264 is encoding the upscaled output at CRF 18 (near-lossless).
 
 app.post('/video', upload.fields([
   { name: 'image', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
 ]), async (req, res) => {
 
-  // Guard: both fields must be present (fix #2)
+  // Guard: both fields must be present
   if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
     return res.status(400).json({ error: 'Both "image" and "audio" fields are required' })
   }
 
   const imgPath = req.files.image[0].path
   const audPath = req.files.audio[0].path
-  const outPath = `/tmp/output_${crypto.randomUUID()}.mp4` // collision-safe (fix #6)
+  const outPath = `/tmp/output_${crypto.randomUUID()}.mp4`
 
   try {
     const audioDuration = getDuration(audPath)
     const totalDuration = audioDuration + 4  // 2s silence before + 2s silence after
 
-    // Ken Burns: zoompan at half-res (600×337) then upscale to full (1200×674)
-    // d=100000 is effectively infinite — actual length is capped by -t
+    // ── Ken Burns filter ────────────────────────────────────────────────────
+    // Runs at half-res (KB_W×KB_H) for CPU efficiency, then upscales.
+    // d=100000 is effectively infinite — actual length is capped by -t.
     const kenBurns =
-      'scale=600:337,' +
+      `scale=${KB_W}:${KB_H},` +
       'zoompan=' +
         "z='1.0+0.1*min(in/75\\,1)*(1+sin(2*3.14159265*in/75))':" +
         "x='iw/2-(iw/zoom/2)':" +
         "y='ih/2-(ih/zoom/2)':" +
-        'd=100000:s=600x337:fps=25,' +
-      'scale=1200:674,' +
+        `d=100000:s=${KB_W}x${KB_H}:fps=25,` +
+      `scale=${OUT_W}:${OUT_H},` +
+      // ensure dimensions are even (required by yuv420p)
       'scale=trunc(iw/2)*2:trunc(ih/2)*2'
 
     // adelay pushes audio 2 s in; apad holds silence 2 s after audio ends
@@ -133,9 +156,16 @@ app.post('/video', upload.fields([
       '-filter_complex', filterComplex,
       '-map', '[v]',
       '-map', '[a]',
-      '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '128k',
+      // ── video quality ──────────────────────────────────────────────────
+      '-c:v',        'libx264',
+      '-crf',        CRF,          // 18 → near-lossless (was default 23)
+      '-preset',     PRESET,       // 'slow' → better quality at same CRF
+      '-profile:v',  PROFILE,      // 'high' → richer encoding tools
+      '-level:v',    LEVEL,        // '4.1' → up to 1080p60, universal support
+      '-pix_fmt',    'yuv420p',
+      '-movflags',   '+faststart', // index at front → instant web playback
+      // ── audio quality ──────────────────────────────────────────────────
+      '-c:a', 'aac', '-b:a', AUDIO_BR,  // 192k (was 128k)
       '-t', String(totalDuration),
       outPath
     ])
@@ -143,7 +173,7 @@ app.post('/video', upload.fields([
     res.set('Content-Type', 'video/mp4')
     res.set('Content-Disposition', 'attachment; filename=slide.mp4')
 
-    // Stream directly to client — no full-file read into RAM (fix #9)
+    // Stream directly to client — no full-file read into RAM.
     // outPath cleanup lives on 'close', NOT in finally{}, so the file
     // is not deleted before the stream finishes sending.
     const stream = fs.createReadStream(outPath)
@@ -154,7 +184,6 @@ app.post('/video', upload.fields([
     cleanup(outPath)
     if (!res.headersSent) res.status(500).json({ error: e.message })
   } finally {
-    // Uploaded temp files can be removed immediately regardless of outcome
     cleanup(imgPath, audPath)
   }
 })
@@ -165,9 +194,9 @@ app.post('/video', upload.fields([
 // Returns:  JSON { url, filename }
 //
 // Transition (per clip):
-//   video fades OUT to black (1s) + audio fades to silence
-//   next video fades IN from black (1s) + audio rises
-//   total black transition = 2 seconds, clips are sequential (no overlap)
+//   video fades OUT to black (FADE s) + audio fades to silence
+//   next video fades IN from black (FADE s) + audio rises
+//   clips are sequential (no overlap)
 
 app.post('/merge', upload.any(), async (req, res) => {
 
@@ -175,7 +204,7 @@ app.post('/merge', upload.any(), async (req, res) => {
     return res.status(400).json({ error: 'No video files uploaded' })
   }
 
-  // Numeric sort: ensures video10 follows video9, not video1 (fix #4)
+  // Numeric sort: ensures video10 follows video9, not video1
   const files = [...req.files].sort((a, b) => {
     const num = s => parseInt(s.replace(/\D/g, ''), 10)
     return num(a.fieldname) - num(b.fieldname)
@@ -185,13 +214,13 @@ app.post('/merge', upload.any(), async (req, res) => {
     return res.status(400).json({ error: 'Need at least 2 videos to merge' })
   }
 
-  const filename = `lesson_${crypto.randomUUID()}.mp4` // collision-safe (fix #6)
+  const filename = `lesson_${crypto.randomUUID()}.mp4`
   const outPath  = path.join(VIDEOS_DIR, filename)
 
   try {
     const durations = files.map(f => getDuration(f.path))
 
-    // Guard: every clip must be long enough to hold fade-in + fade-out (fix #3)
+    // Guard: every clip must be long enough to hold fade-in + fade-out
     for (let i = 0; i < files.length; i++) {
       if (durations[i] < FADE * 2) {
         return res.status(400).json({
@@ -220,9 +249,16 @@ app.post('/merge', upload.any(), async (req, res) => {
       '-filter_complex', filters.join(';'),
       '-map', '[vout]',
       '-map', '[aout]',
-      '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '128k',
+      // ── video quality (same settings as /video) ────────────────────────
+      '-c:v',        'libx264',
+      '-crf',        CRF,
+      '-preset',     PRESET,
+      '-profile:v',  PROFILE,
+      '-level:v',    LEVEL,
+      '-pix_fmt',    'yuv420p',
+      '-movflags',   '+faststart',
+      // ── audio quality ──────────────────────────────────────────────────
+      '-c:a', 'aac', '-b:a', AUDIO_BR,
       outPath
     ])
 
@@ -240,8 +276,6 @@ app.post('/merge', upload.any(), async (req, res) => {
 // ─── /delete/:filename ───────────────────────────────────────────────────────
 
 app.delete('/delete/:filename', (req, res) => {
-  // path.basename strips any directory components from the input
-  // the startsWith check is a second layer against encoded traversal (fix #12)
   const filename = path.basename(req.params.filename)
   const filePath = path.join(VIDEOS_DIR, filename)
 
@@ -258,7 +292,7 @@ app.delete('/delete/:filename', (req, res) => {
 })
 
 // ─── /health ─────────────────────────────────────────────────────────────────
-// Verifies ffprobe is actually functional, not just that the process is up (fix #13)
+// Verifies ffprobe is actually functional, not just that the process is up
 
 app.get('/health', (req, res) => {
   try {
