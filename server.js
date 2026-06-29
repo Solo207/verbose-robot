@@ -8,7 +8,7 @@ const crypto   = require('crypto')
 // ─── constants ───────────────────────────────────────────────────────────────
 
 const VIDEOS_DIR     = '/app/videos'
-const FADE           = 20.0              // seconds per side → 2s total transition
+const FADE           = 0.5              // seconds per side → 2s total transition
 const MAX_FFMPEG_MS  = 5 * 60 * 1000   // 5-minute hard timeout per ffmpeg process
 const UPLOAD_LIMIT   = 200 * 1024 * 1024 // 200 MB per file
 const MAX_CONCURRENT = 2               // max simultaneous ffmpeg jobs (ALL endpoints combined)
@@ -221,26 +221,38 @@ app.post('/video', upload.fields([
     // ── Breathing zoom filter ───────────────────────────────────────────────
     // Runs at half-res (KB_W×KB_H) for CPU efficiency, then upscales.
     //
-    // d = actual frame count needed for this video (was 100000 — a leftover
-    // placeholder that asked zoompan to budget for ~66 min of frame cache).
-    // Setting it to the real value cuts zoompan's internal frame-buffer RAM
-    // to exactly what the clip requires.
+    // WHY `ot` and not `in`:
+    //   zoompan exposes two counters — `in` (input frame index) and `ot`
+    //   (output timestamp in seconds).  With -loop 1 feeding a still image,
+    //   a single input frame (in=0) produces all `d` output frames, so `in`
+    //   is stuck at 0 for the entire clip and any formula written in terms of
+    //   `in` evaluates to a constant — the image would never move.
+    //   `ot` increments correctly for every output frame and makes the formula
+    //   frame-rate independent as a bonus.
     //
-    // Formula: z(frame) = 1 + ZOOM_STRENGTH × ½ × (1 − cos(2π × frame / cycleFrames))
-    //   • raised-cosine shape → starts and ends at minimum zoom, no jump at loops
-    //   • x/y kept centred so the zoom pulses symmetrically around the image centre
+    // Shape: raised cosine — starts at minimum zoom, peaks at ZOOM_PERIOD/2,
+    //   returns to minimum.  No brightness change, no opacity change.
+    //   Camera stays locked to the image centre throughout.
     //
-    // Tune ZOOM_STRENGTH and ZOOM_PERIOD at the top of the file.
-    const totalFrames  = Math.ceil(totalDuration * FPS)
-    const cycleFrames  = (ZOOM_PERIOD * FPS).toFixed(3)
-    const zoomExpr     = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*in/${cycleFrames}))`
+    //   z(ot) = 1  +  ZOOM_STRENGTH × ½ × (1 − cos(2π × ot / ZOOM_PERIOD))
+    //
+    //   ot = 0             →  z = 1.0               (normal, no zoom)
+    //   ot = ZOOM_PERIOD/2 →  z = 1 + ZOOM_STRENGTH (maximum zoom-in)
+    //   ot = ZOOM_PERIOD   →  z = 1.0               (back to start, seamless)
+    //
+    // ── To tune the effect, edit these two constants at the top of the file ─
+    //   ZOOM_STRENGTH  →  zoom travel per pulse     e.g. 0.04 (subtle) – 0.20 (dramatic)
+    //   ZOOM_PERIOD    →  seconds per full cycle     e.g. 2 (fast) – 8 (slow drift)
+    // ────────────────────────────────────────────────────────────────────────
+    const totalFrames = Math.ceil(totalDuration * FPS)
+    const zoomExpr    = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*ot/${ZOOM_PERIOD}))`
 
     const kenBurns =
       `scale=${KB_W}:${KB_H},` +
       'zoompan=' +
         `z='${zoomExpr}':` +
-        "x='iw/2-(iw/zoom/2)':" +
-        "y='ih/2-(ih/zoom/2)':" +
+        "x='iw/2-(iw/zoom/2)':" +      // lock to horizontal centre
+        "y='ih/2-(ih/zoom/2)':" +      // lock to vertical centre
         `d=${totalFrames}:s=${KB_W}x${KB_H}:fps=${FPS},` +
       `scale=${OUT_W}:${OUT_H},` +
       // ensure dimensions are even (required by yuv420p)
