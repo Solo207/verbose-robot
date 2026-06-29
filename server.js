@@ -106,7 +106,7 @@ app.post('/merge', upload.any(), (req, res) => {
 
   const filename = `lesson_${Date.now()}.mp4`
   const outPath = path.join(VIDEOS_DIR, filename)
-  const FADE = 1.75 // seconds per side → 3.5s total transition
+  const FADE = 1.0 // seconds per side → 3.5s total transition
 
   try {
     const durations = files.map(f => getDuration(f.path))
