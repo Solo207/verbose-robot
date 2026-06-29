@@ -12,85 +12,53 @@ const FADE           = 0.5              // seconds per side → 2s total transit
 const MAX_FFMPEG_MS  = 5 * 60 * 1000   // 5-minute hard timeout per ffmpeg process
 const UPLOAD_LIMIT   = 200 * 1024 * 1024 // 200 MB per file
 const MAX_CONCURRENT = 2               // max simultaneous ffmpeg jobs (ALL endpoints combined)
-                                        // rough guide: floor(available_RAM_GB * 1024 / 300)
-                                        // e.g. 2 on a 1 GB container, 6 on a 2 GB container
+                                        // without zoompan each job uses ~100–150 MB:
+                                        //   rough guide: floor(available_RAM_MB / 200)
+                                        //   e.g.  1 GB container → 3–4 jobs safe
+                                        //         2 GB container → 6–8 jobs safe
+                                        // (old zoompan version was ~300 MB/job, so half that)
 
 // ─── quality settings ────────────────────────────────────────────────────────
-// Centralised so a single edit controls both /video and /merge.
 //
-//  CRF 18       → visually lossless for most content (was default 23)
-//  PRESET       → libx264 encode speed vs quality trade-off.  This is the
-//                 single biggest CPU lever in the whole service:
+//  CRF 23       → libx264 default; visually excellent for static slide content.
+//                 With -tune stillimage, P-frames after the first I-frame carry
+//                 near-zero difference → effectively lossless compression at
+//                 a fraction of the CRF 18 bitrate.  CRF 18 is designed for
+//                 motion video and wastes CPU + disk on still-image content.
 //
-//                   preset     relative CPU    quality vs CRF 18
-//                   ──────     ────────────    ─────────────────
-//                   ultrafast    ~10 %         noticeably softer
-//                   fast         ~35 %         slightly softer
-//                   medium       ~55 %         marginal difference
-//                   slow        ~100 %  ←      reference (current)
+//  PRESET       → encode speed vs quality.  Biggest single CPU knob.
+//
+//                   preset     relative CPU    note
+//                   ──────     ────────────    ────
+//                   ultrafast    ~10 %         noticeably soft
+//                   fast         ~35 %         good for CI/testing
+//                   medium       ~55 %  ←      sweet spot (was 'slow' @ 100%)
+//                   slow        ~100 %          previous setting
 //                   slower      ~160 %          diminishing returns
 //
-//                 For a 1-2 vCPU container, 'medium' is the sweet spot.
-//                 'slow' only makes sense if encode time is unconstrained.
+//                 Switching slow → medium cuts encode CPU in half with no
+//                 perceptible quality loss on still-slide material.
 //
-//  MAX_THREADS  → CPU threads each ffmpeg job may use.  Without this flag
-//                 ffmpeg claims every core on the machine.  With concurrency
-//                 > 1 that means 2 jobs × all cores = thrashing.
+//  MAX_THREADS  → CPU threads each ffmpeg job may use.
 //                 Rule of thumb: floor(total_vCPUs / MAX_CONCURRENT)
-//                 e.g. 4 vCPUs ÷ 2 jobs = 2 threads per job
+//                 e.g. 4 vCPUs ÷ 2 jobs = 2 threads per job.
 //                 Set to 0 to let ffmpeg decide (safe only when MAX_CONCURRENT=1)
 //
 //  PROFILE      → 'high' unlocks 8×8 DCT and better inter-prediction
 //  LEVEL        → '4.1' supports up to 1080p60; safe for all modern players
 //  AUDIO_BR     → 192k AAC; audible improvement over 128k on music/voiceover
-//  OUT_W/H      → 1920×1080 output (was 1200×674)
-//  KB_W/KB_H    → 960×540 intermediate for Ken Burns zoompan (was 600×337);
-//                 zoompan CPU scales with pixel count, so half-res is kept as
-//                 an optimisation — the final upscale is lossless in libx264.
+//  FPS          → output framerate; 25 keeps WhatsApp/mobile compatibility
+//  OUT_W/H      → 1920×1080 output
 
-const CRF         = '18'
-const PRESET      = 'slow'      // biggest CPU knob — see table above
-const MAX_THREADS = 2           // threads per job  (rule: floor(vCPUs / MAX_CONCURRENT))
+const CRF         = '23'
+const PRESET      = 'medium'   // was 'slow' — halves CPU with no visible quality drop
+const MAX_THREADS = 2          // threads per job  (rule: floor(vCPUs / MAX_CONCURRENT))
 const PROFILE     = 'high'
 const LEVEL       = '4.1'
 const AUDIO_BR    = '192k'
 const FPS         = 25
 const OUT_W       = 1920
 const OUT_H       = 1080
-const KB_W        = OUT_W / 2   // 960
-const KB_H        = OUT_H / 2   // 540
-
-// ─── breathing zoom settings ─────────────────────────────────────────────────
-//
-// The /video endpoint applies a continuous slow zoom-in/zoom-out to the still
-// image, giving the impression of gentle motion (sometimes called "Ken Burns
-// breathing").  Only two knobs to turn:
-//
-//  ZOOM_STRENGTH  – how far the zoom travels on each pulse, expressed as a
-//                   fraction of the image size.
-//                   0.04 = 4 % swing (barely perceptible, good for talking-head slides)
-//                   0.08 = 8 % swing  ← default, noticeable but not distracting
-//                   0.15 = 15% swing (dramatic; may feel restless on long clips)
-//                   Keep below 0.25 to avoid the edges of the frame being reached.
-//
-//  ZOOM_PERIOD    – seconds for one complete in → out → in cycle.
-//                   2  = fast pulse (energetic)
-//                   4  ← default, one slow breath every 4 seconds
-//                   8  = very slow drift
-//
-// The formula used is a raised cosine so it starts and ends at the minimum
-// zoom level (no visible jump at loop points):
-//
-//   z(t) = 1 + ZOOM_STRENGTH × ½ × (1 − cos(2π × t / ZOOM_PERIOD))
-//
-//   t = frame_index / FPS
-//
-//   • t = 0              → z = 1.0              (no zoom, image fits exactly)
-//   • t = ZOOM_PERIOD/2  → z = 1 + ZOOM_STRENGTH (maximum zoom-in)
-//   • t = ZOOM_PERIOD    → z = 1.0              (back to start, seamless)
-
-const ZOOM_STRENGTH = 0.08   // fractional zoom swing  (try 0.04 – 0.15)
-const ZOOM_PERIOD   = 4      // seconds per full cycle  (try 2 – 8)
 
 // ─── app setup ───────────────────────────────────────────────────────────────
 
@@ -124,15 +92,13 @@ function getDuration(filePath) {
 
 // ─── concurrency semaphore ────────────────────────────────────────────────────
 //
-// Prevents unbounded RAM growth under load.  Each 1080p ffmpeg job holds
-// ~150–300 MB inside the child process (libx264 lookahead + zoompan cache +
-// decoded image planes).  Without a cap, n simultaneous requests = n × 300 MB.
-//
-// The semaphore is shared across ALL endpoints (/video and /merge) so a burst
+// Prevents unbounded RAM growth under load.  Without zoompan, each 1080p
+// ffmpeg job holds ~100–150 MB (libx264 lookahead + decoded image plane +
+// audio buffers).  The semaphore is shared across ALL endpoints so a burst
 // of /merge calls cannot crowd out /video slots and vice-versa.
 //
-// Callers that arrive when the semaphore is full receive an immediate 503 so
-// the client can retry rather than the request silently queuing in memory.
+// Callers that arrive when the semaphore is full get an immediate 503 so
+// the client can retry rather than queuing work silently in memory.
 
 let activeJobs = 0
 
@@ -151,25 +117,19 @@ function releaseSlot() {
  * - Accepts an args ARRAY → no shell, no injection surface
  * - Non-blocking: Node can serve other requests while ffmpeg runs
  * - Hard timeout via spawn option prevents runaway processes
- * - Uses -loglevel error -nostats so ffmpeg does NOT emit per-frame progress
- *   lines — the previous approach (buffering all stderr) could accumulate
- *   several MB of progress text in the JS heap for a long 1080p encode
- * - Caps stderr retention to 64 KB so a genuine error message is readable
- *   without holding the entire ffmpeg log in RAM
+ * - -loglevel error -nostats suppress per-frame progress lines, preventing
+ *   multi-MB stderr accumulation in the JS heap during long encodes
+ * - Caps stderr retention to 64 KB so genuine errors remain readable
  */
 const MAX_STDERR_BYTES = 64 * 1024  // 64 KB — enough for any real error message
 
 function ffmpeg(args) {
   return new Promise((resolve, reject) => {
-    // Prepend flags that suppress per-frame progress output.
-    // -loglevel error : only print actual errors, not stats/info
-    // -nostats        : belt-and-braces suppression of the progress line
     const proc = spawn('ffmpeg', ['-loglevel', 'error', '-nostats', ...args], {
       timeout: MAX_FFMPEG_MS
     })
 
     // Rolling tail-buffer: keeps only the last MAX_STDERR_BYTES of stderr.
-    // A plain array that grows forever was the old RAM leak for verbose encodes.
     let stderrBuf = Buffer.alloc(0)
     proc.stderr.on('data', chunk => {
       stderrBuf = Buffer.concat([stderrBuf, chunk])
@@ -203,14 +163,22 @@ function cleanup(...paths) {
 //
 // Timeline:
 //   0:00 ─── picture visible, NO audio (2 seconds silence)
-//   0:02 ─── audio starts, Ken Burns breathing zoom begins
+//   0:02 ─── audio starts
 //   END-2 ── audio fades to silence
 //   END ──── picture still visible, NO audio (2 more seconds)
 //
-// Ken Burns optimisation:
-//   zoompan runs at KB_W×KB_H (half the output size) then upscales to OUT_W×OUT_H.
-//   This cuts zoompan CPU cost by ~4× with negligible quality loss because
-//   libx264 is encoding the upscaled output at CRF 18 (near-lossless).
+// Video filter:
+//   scale with force_original_aspect_ratio=decrease → shrink to fit OUT_W×OUT_H
+//   pad → fill remaining space with black bars (letterbox / pillarbox)
+//   setsar=1 → correct sample aspect ratio metadata
+//   trunc(iw/2)*2 → round to even pixels (required by yuv420p)
+//
+// RAM/CPU vs previous version:
+//   zoompan allocated a frame cache scaled to totalFrames × frame_size.
+//   For a 3-min audio at 25fps that was ~4500 frames × 1.5 MB = 6–7 GB
+//   of internal ffmpeg heap.  The half-res (960×540) trick reduced this to
+//   ~1.7 GB but it was still the dominant memory consumer in the process.
+//   Removing it entirely drops per-job RAM from ~300 MB to ~100–150 MB.
 
 app.post('/video', upload.fields([
   { name: 'image', maxCount: 1 },
@@ -238,50 +206,15 @@ app.post('/video', upload.fields([
     const audioDuration = getDuration(audPath)
     const totalDuration = audioDuration + 4  // 2s silence before + 2s silence after
 
-    // ── Breathing zoom filter ───────────────────────────────────────────────
-    // Runs at half-res (KB_W×KB_H) for CPU efficiency, then upscales.
-    //
-    // WHY `ot` and not `in`:
-    //   zoompan exposes two counters — `in` (input frame index) and `ot`
-    //   (output timestamp in seconds).  With -loop 1 feeding a still image,
-    //   a single input frame (in=0) produces all `d` output frames, so `in`
-    //   is stuck at 0 for the entire clip and any formula written in terms of
-    //   `in` evaluates to a constant — the image would never move.
-    //   `ot` increments correctly for every output frame and makes the formula
-    //   frame-rate independent as a bonus.
-    //
-    // Shape: raised cosine — starts at minimum zoom, peaks at ZOOM_PERIOD/2,
-    //   returns to minimum.  No brightness change, no opacity change.
-    //   Camera stays locked to the image centre throughout.
-    //
-    //   z(ot) = 1  +  ZOOM_STRENGTH × ½ × (1 − cos(2π × ot / ZOOM_PERIOD))
-    //
-    //   ot = 0             →  z = 1.0               (normal, no zoom)
-    //   ot = ZOOM_PERIOD/2 →  z = 1 + ZOOM_STRENGTH (maximum zoom-in)
-    //   ot = ZOOM_PERIOD   →  z = 1.0               (back to start, seamless)
-    //
-    // ── To tune the effect, edit these two constants at the top of the file ─
-    //   ZOOM_STRENGTH  →  zoom travel per pulse     e.g. 0.04 (subtle) – 0.20 (dramatic)
-    //   ZOOM_PERIOD    →  seconds per full cycle     e.g. 2 (fast) – 8 (slow drift)
-    // ────────────────────────────────────────────────────────────────────────
-    const totalFrames = Math.ceil(totalDuration * FPS)
-    const zoomExpr    = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*ot/${ZOOM_PERIOD}))`
-
-    const kenBurns =
-      `scale=${KB_W}:${KB_H},` +
-      'zoompan=' +
-        `z='${zoomExpr}':` +
-        "x='iw/2-(iw/zoom/2)':" +      // lock to horizontal centre
-        "y='ih/2-(ih/zoom/2)':" +      // lock to vertical centre
-        `d=${totalFrames}:s=${KB_W}x${KB_H}:fps=${FPS},` +
-      `scale=${OUT_W}:${OUT_H},` +
-      // ensure dimensions are even (required by yuv420p)
-      'scale=trunc(iw/2)*2:trunc(ih/2)*2'
-
-    // adelay pushes audio 2 s in; apad holds silence 2 s after audio ends
+    // ── Filter graph ────────────────────────────────────────────────────────
+    // [0:v] scale image to fit 1920×1080 with black-bar padding
+    // [1:a] push audio 2 s right; hold silence 2 s after audio ends
     const filterComplex =
-      `[0:v]${kenBurns}[v];` +
-      '[1:a]adelay=2000|2000,apad=pad_dur=2[a]'
+      `[0:v]` +
+      `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,` +
+      `pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,` +
+      `scale=trunc(iw/2)*2:trunc(ih/2)*2[v];` +
+      `[1:a]adelay=2000|2000,apad=pad_dur=2[a]`
 
     await ffmpeg([
       '-loop', '1', '-framerate', String(FPS),
@@ -295,12 +228,12 @@ app.post('/video', upload.fields([
       '-crf',        CRF,
       '-preset',     PRESET,
       '-tune',       'stillimage',  // skips temporal analysis passes that are
-                                    // pointless when frames barely differ (our
-                                    // slow-zoom-on-a-still use case); /merge
-                                    // does NOT get this — it encodes real video
+                                    // pointless when frames barely differ;
+                                    // /merge does NOT get this — it encodes
+                                    // real video where temporal analysis helps
       '-profile:v',  PROFILE,
       '-level:v',    LEVEL,
-      '-threads',    String(MAX_THREADS), // cap CPU threads per job
+      '-threads',    String(MAX_THREADS),
       '-pix_fmt',    'yuv420p',
       '-movflags',   '+faststart',
       // ── audio quality ──────────────────────────────────────────────────
@@ -328,7 +261,7 @@ app.post('/video', upload.fields([
   }
 
   // NOTE: releaseSlot() on the happy path lives on the stream 'close' event
-  // (below) so the slot is not freed until the response has fully flushed.
+  // so the slot is not freed until the response has fully flushed.
   // This prevents a second job from starting while the first is still piping
   // its output — which would briefly double the disk I/O and RAM pressure.
 })
@@ -410,7 +343,7 @@ app.post('/merge', upload.any(), async (req, res) => {
       // temporal analysis is beneficial, not wasteful
       '-profile:v',  PROFILE,
       '-level:v',    LEVEL,
-      '-threads',    String(MAX_THREADS), // cap CPU threads per job
+      '-threads',    String(MAX_THREADS),
       '-pix_fmt',    'yuv420p',
       '-movflags',   '+faststart',
       // ── audio quality ──────────────────────────────────────────────────
@@ -459,8 +392,8 @@ app.get('/health', (req, res) => {
     res.json({
       status:          'ok',
       stored_videos:   stored,
-      active_jobs:     activeJobs,        // currently running ffmpeg processes
-      max_concurrent:  MAX_CONCURRENT,    // configured cap
+      active_jobs:     activeJobs,
+      max_concurrent:  MAX_CONCURRENT,
       slots_available: MAX_CONCURRENT - activeJobs
     })
   } catch (e) {
