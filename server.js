@@ -8,9 +8,12 @@ const crypto   = require('crypto')
 // ─── constants ───────────────────────────────────────────────────────────────
 
 const VIDEOS_DIR     = '/app/videos'
-const FADE           = 1.0              // seconds per side → 2s total transition
+const FADE           = 20.0              // seconds per side → 2s total transition
 const MAX_FFMPEG_MS  = 5 * 60 * 1000   // 5-minute hard timeout per ffmpeg process
 const UPLOAD_LIMIT   = 200 * 1024 * 1024 // 200 MB per file
+const MAX_CONCURRENT = 2               // max simultaneous ffmpeg jobs (ALL endpoints combined)
+                                        // rough guide: floor(available_RAM_GB * 1024 / 300)
+                                        // e.g. 2 on a 1 GB container, 6 on a 2 GB container
 
 // ─── quality settings ────────────────────────────────────────────────────────
 // Centralised so a single edit controls both /video and /merge.
@@ -99,21 +102,65 @@ function getDuration(filePath) {
   return duration
 }
 
+// ─── concurrency semaphore ────────────────────────────────────────────────────
+//
+// Prevents unbounded RAM growth under load.  Each 1080p ffmpeg job holds
+// ~150–300 MB inside the child process (libx264 lookahead + zoompan cache +
+// decoded image planes).  Without a cap, n simultaneous requests = n × 300 MB.
+//
+// The semaphore is shared across ALL endpoints (/video and /merge) so a burst
+// of /merge calls cannot crowd out /video slots and vice-versa.
+//
+// Callers that arrive when the semaphore is full receive an immediate 503 so
+// the client can retry rather than the request silently queuing in memory.
+
+let activeJobs = 0
+
+function acquireSlot() {
+  if (activeJobs >= MAX_CONCURRENT) return false
+  activeJobs++
+  return true
+}
+
+function releaseSlot() {
+  activeJobs = Math.max(0, activeJobs - 1)
+}
+
 /**
  * Async ffmpeg wrapper.
  * - Accepts an args ARRAY → no shell, no injection surface
  * - Non-blocking: Node can serve other requests while ffmpeg runs
  * - Hard timeout via spawn option prevents runaway processes
- * - Captures stderr so errors are readable
+ * - Uses -loglevel error -nostats so ffmpeg does NOT emit per-frame progress
+ *   lines — the previous approach (buffering all stderr) could accumulate
+ *   several MB of progress text in the JS heap for a long 1080p encode
+ * - Caps stderr retention to 64 KB so a genuine error message is readable
+ *   without holding the entire ffmpeg log in RAM
  */
+const MAX_STDERR_BYTES = 64 * 1024  // 64 KB — enough for any real error message
+
 function ffmpeg(args) {
   return new Promise((resolve, reject) => {
-    const proc   = spawn('ffmpeg', args, { timeout: MAX_FFMPEG_MS })
-    const stderr = []
-    proc.stderr.on('data', chunk => stderr.push(chunk))
+    // Prepend flags that suppress per-frame progress output.
+    // -loglevel error : only print actual errors, not stats/info
+    // -nostats        : belt-and-braces suppression of the progress line
+    const proc = spawn('ffmpeg', ['-loglevel', 'error', '-nostats', ...args], {
+      timeout: MAX_FFMPEG_MS
+    })
+
+    // Rolling tail-buffer: keeps only the last MAX_STDERR_BYTES of stderr.
+    // A plain array that grows forever was the old RAM leak for verbose encodes.
+    let stderrBuf = Buffer.alloc(0)
+    proc.stderr.on('data', chunk => {
+      stderrBuf = Buffer.concat([stderrBuf, chunk])
+      if (stderrBuf.length > MAX_STDERR_BYTES) {
+        stderrBuf = stderrBuf.slice(stderrBuf.length - MAX_STDERR_BYTES)
+      }
+    })
+
     proc.on('close', code => {
       if (code === 0) resolve()
-      else reject(new Error(Buffer.concat(stderr).toString()))
+      else reject(new Error(stderrBuf.toString()))
     })
     proc.on('error', reject)
   })
@@ -159,21 +206,34 @@ app.post('/video', upload.fields([
   const audPath = req.files.audio[0].path
   const outPath = `/tmp/output_${crypto.randomUUID()}.mp4`
 
+  // Reject early if all encode slots are busy — avoids queuing work in RAM
+  if (!acquireSlot()) {
+    cleanup(imgPath, audPath)
+    return res.status(503).json({
+      error: `Server busy — ${MAX_CONCURRENT} encodes already running. Try again shortly.`
+    })
+  }
+
   try {
     const audioDuration = getDuration(audPath)
     const totalDuration = audioDuration + 4  // 2s silence before + 2s silence after
 
     // ── Breathing zoom filter ───────────────────────────────────────────────
     // Runs at half-res (KB_W×KB_H) for CPU efficiency, then upscales.
-    // d=100000 is effectively infinite — actual length is capped by -t.
+    //
+    // d = actual frame count needed for this video (was 100000 — a leftover
+    // placeholder that asked zoompan to budget for ~66 min of frame cache).
+    // Setting it to the real value cuts zoompan's internal frame-buffer RAM
+    // to exactly what the clip requires.
     //
     // Formula: z(frame) = 1 + ZOOM_STRENGTH × ½ × (1 − cos(2π × frame / cycleFrames))
     //   • raised-cosine shape → starts and ends at minimum zoom, no jump at loops
     //   • x/y kept centred so the zoom pulses symmetrically around the image centre
     //
     // Tune ZOOM_STRENGTH and ZOOM_PERIOD at the top of the file.
-    const cycleFrames = (ZOOM_PERIOD * FPS).toFixed(3)
-    const zoomExpr    = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*in/${cycleFrames}))`
+    const totalFrames  = Math.ceil(totalDuration * FPS)
+    const cycleFrames  = (ZOOM_PERIOD * FPS).toFixed(3)
+    const zoomExpr     = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*in/${cycleFrames}))`
 
     const kenBurns =
       `scale=${KB_W}:${KB_H},` +
@@ -181,7 +241,7 @@ app.post('/video', upload.fields([
         `z='${zoomExpr}':` +
         "x='iw/2-(iw/zoom/2)':" +
         "y='ih/2-(ih/zoom/2)':" +
-        `d=100000:s=${KB_W}x${KB_H}:fps=${FPS},` +
+        `d=${totalFrames}:s=${KB_W}x${KB_H}:fps=${FPS},` +
       `scale=${OUT_W}:${OUT_H},` +
       // ensure dimensions are even (required by yuv420p)
       'scale=trunc(iw/2)*2:trunc(ih/2)*2'
@@ -220,14 +280,20 @@ app.post('/video', upload.fields([
     // is not deleted before the stream finishes sending.
     const stream = fs.createReadStream(outPath)
     stream.pipe(res)
-    stream.on('close', () => cleanup(outPath))
+    stream.on('close', () => { cleanup(outPath); releaseSlot() })
 
   } catch (e) {
     cleanup(outPath)
+    releaseSlot()
     if (!res.headersSent) res.status(500).json({ error: e.message })
   } finally {
     cleanup(imgPath, audPath)
   }
+
+  // NOTE: releaseSlot() on the happy path lives on the stream 'close' event
+  // (below) so the slot is not freed until the response has fully flushed.
+  // This prevents a second job from starting while the first is still piping
+  // its output — which would briefly double the disk I/O and RAM pressure.
 })
 
 // ─── /merge ──────────────────────────────────────────────────────────────────
@@ -258,6 +324,14 @@ app.post('/merge', upload.any(), async (req, res) => {
 
   const filename = `lesson_${crypto.randomUUID()}.mp4`
   const outPath  = path.join(VIDEOS_DIR, filename)
+
+  // Reject early if all encode slots are busy
+  if (!acquireSlot()) {
+    files.forEach(f => cleanup(f.path))
+    return res.status(503).json({
+      error: `Server busy — ${MAX_CONCURRENT} encodes already running. Try again shortly.`
+    })
+  }
 
   try {
     const durations = files.map(f => getDuration(f.path))
@@ -306,9 +380,11 @@ app.post('/merge', upload.any(), async (req, res) => {
 
     const baseUrl = `${req.protocol}://${req.get('host')}`
     res.json({ url: `${baseUrl}/videos/${filename}`, filename })
+    releaseSlot()
 
   } catch (e) {
     cleanup(outPath)
+    releaseSlot()
     if (!res.headersSent) res.status(500).json({ error: e.message })
   } finally {
     files.forEach(f => cleanup(f.path))
@@ -340,7 +416,13 @@ app.get('/health', (req, res) => {
   try {
     execFileSync('ffprobe', ['-version'], { timeout: 5_000 })
     const stored = fs.readdirSync(VIDEOS_DIR).length
-    res.json({ status: 'ok', stored_videos: stored })
+    res.json({
+      status:          'ok',
+      stored_videos:   stored,
+      active_jobs:     activeJobs,        // currently running ffmpeg processes
+      max_concurrent:  MAX_CONCURRENT,    // configured cap
+      slots_available: MAX_CONCURRENT - activeJobs
+    })
   } catch (e) {
     res.status(500).json({ status: 'error', message: 'ffprobe unavailable', detail: e.message })
   }
