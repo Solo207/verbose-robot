@@ -18,27 +18,47 @@ const MAX_CONCURRENT = 2               // max simultaneous ffmpeg jobs (ALL endp
 // ─── quality settings ────────────────────────────────────────────────────────
 // Centralised so a single edit controls both /video and /merge.
 //
-//  CRF 18    → visually lossless for most content (was default 23)
-//  preset    → 'slow' squeezes ~15–20 % more quality out of the same CRF
-//              at the cost of extra encode time (was unset → 'medium')
-//  PROFILE   → 'high' unlocks 8×8 DCT and better inter-prediction
-//  LEVEL     → '4.1' supports up to 1080p60; safe for all modern players
-//  AUDIO_BR  → 192k AAC; audible improvement over 128k on music/voiceover
-//  OUT_W/H   → 1920×1080 output (was 1200×674)
-//  KB_W/KB_H → 960×540 intermediate for Ken Burns zoompan (was 600×337);
-//              zoompan CPU scales with pixel count, so half-res is kept as
-//              an optimisation — the final upscale is lossless in libx264.
+//  CRF 18       → visually lossless for most content (was default 23)
+//  PRESET       → libx264 encode speed vs quality trade-off.  This is the
+//                 single biggest CPU lever in the whole service:
+//
+//                   preset     relative CPU    quality vs CRF 18
+//                   ──────     ────────────    ─────────────────
+//                   ultrafast    ~10 %         noticeably softer
+//                   fast         ~35 %         slightly softer
+//                   medium       ~55 %         marginal difference
+//                   slow        ~100 %  ←      reference (current)
+//                   slower      ~160 %          diminishing returns
+//
+//                 For a 1-2 vCPU container, 'medium' is the sweet spot.
+//                 'slow' only makes sense if encode time is unconstrained.
+//
+//  MAX_THREADS  → CPU threads each ffmpeg job may use.  Without this flag
+//                 ffmpeg claims every core on the machine.  With concurrency
+//                 > 1 that means 2 jobs × all cores = thrashing.
+//                 Rule of thumb: floor(total_vCPUs / MAX_CONCURRENT)
+//                 e.g. 4 vCPUs ÷ 2 jobs = 2 threads per job
+//                 Set to 0 to let ffmpeg decide (safe only when MAX_CONCURRENT=1)
+//
+//  PROFILE      → 'high' unlocks 8×8 DCT and better inter-prediction
+//  LEVEL        → '4.1' supports up to 1080p60; safe for all modern players
+//  AUDIO_BR     → 192k AAC; audible improvement over 128k on music/voiceover
+//  OUT_W/H      → 1920×1080 output (was 1200×674)
+//  KB_W/KB_H    → 960×540 intermediate for Ken Burns zoompan (was 600×337);
+//                 zoompan CPU scales with pixel count, so half-res is kept as
+//                 an optimisation — the final upscale is lossless in libx264.
 
-const CRF      = '18'
-const PRESET   = 'slow'
-const PROFILE  = 'high'
-const LEVEL    = '4.1'
-const AUDIO_BR = '192k'
-const FPS      = 25
-const OUT_W    = 1920
-const OUT_H    = 1080
-const KB_W     = OUT_W / 2   // 960
-const KB_H     = OUT_H / 2   // 540
+const CRF         = '18'
+const PRESET      = 'slow'      // biggest CPU knob — see table above
+const MAX_THREADS = 2           // threads per job  (rule: floor(vCPUs / MAX_CONCURRENT))
+const PROFILE     = 'high'
+const LEVEL       = '4.1'
+const AUDIO_BR    = '192k'
+const FPS         = 25
+const OUT_W       = 1920
+const OUT_H       = 1080
+const KB_W        = OUT_W / 2   // 960
+const KB_H        = OUT_H / 2   // 540
 
 // ─── breathing zoom settings ─────────────────────────────────────────────────
 //
@@ -69,7 +89,7 @@ const KB_H     = OUT_H / 2   // 540
 //   • t = ZOOM_PERIOD/2  → z = 1 + ZOOM_STRENGTH (maximum zoom-in)
 //   • t = ZOOM_PERIOD    → z = 1.0              (back to start, seamless)
 
-const ZOOM_STRENGTH = 0.10   // fractional zoom swing  (try 0.04 – 0.15)
+const ZOOM_STRENGTH = 0.08   // fractional zoom swing  (try 0.04 – 0.15)
 const ZOOM_PERIOD   = 4      // seconds per full cycle  (try 2 – 8)
 
 // ─── app setup ───────────────────────────────────────────────────────────────
@@ -272,14 +292,19 @@ app.post('/video', upload.fields([
       '-map', '[a]',
       // ── video quality ──────────────────────────────────────────────────
       '-c:v',        'libx264',
-      '-crf',        CRF,          // 18 → near-lossless (was default 23)
-      '-preset',     PRESET,       // 'slow' → better quality at same CRF
-      '-profile:v',  PROFILE,      // 'high' → richer encoding tools
-      '-level:v',    LEVEL,        // '4.1' → up to 1080p60, universal support
+      '-crf',        CRF,
+      '-preset',     PRESET,
+      '-tune',       'stillimage',  // skips temporal analysis passes that are
+                                    // pointless when frames barely differ (our
+                                    // slow-zoom-on-a-still use case); /merge
+                                    // does NOT get this — it encodes real video
+      '-profile:v',  PROFILE,
+      '-level:v',    LEVEL,
+      '-threads',    String(MAX_THREADS), // cap CPU threads per job
       '-pix_fmt',    'yuv420p',
-      '-movflags',   '+faststart', // index at front → instant web playback
+      '-movflags',   '+faststart',
       // ── audio quality ──────────────────────────────────────────────────
-      '-c:a', 'aac', '-b:a', AUDIO_BR,  // 192k (was 128k)
+      '-c:a', 'aac', '-b:a', AUDIO_BR,
       '-t', String(totalDuration),
       outPath
     ])
@@ -377,12 +402,15 @@ app.post('/merge', upload.any(), async (req, res) => {
       '-filter_complex', filters.join(';'),
       '-map', '[vout]',
       '-map', '[aout]',
-      // ── video quality (same settings as /video) ────────────────────────
+      // ── video quality ─────────────────────────────────────────────────
       '-c:v',        'libx264',
       '-crf',        CRF,
       '-preset',     PRESET,
+      // no -tune stillimage here — /merge encodes real video clips where
+      // temporal analysis is beneficial, not wasteful
       '-profile:v',  PROFILE,
       '-level:v',    LEVEL,
+      '-threads',    String(MAX_THREADS), // cap CPU threads per job
       '-pix_fmt',    'yuv420p',
       '-movflags',   '+faststart',
       // ── audio quality ──────────────────────────────────────────────────
