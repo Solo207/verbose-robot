@@ -69,7 +69,7 @@ const KB_H     = OUT_H / 2   // 540
 //   • t = ZOOM_PERIOD/2  → z = 1 + ZOOM_STRENGTH (maximum zoom-in)
 //   • t = ZOOM_PERIOD    → z = 1.0              (back to start, seamless)
 
-const ZOOM_STRENGTH = 0.08   // fractional zoom swing  (try 0.04 – 0.15)
+const ZOOM_STRENGTH = 0.10   // fractional zoom swing  (try 0.04 – 0.15)
 const ZOOM_PERIOD   = 4      // seconds per full cycle  (try 2 – 8)
 
 // ─── app setup ───────────────────────────────────────────────────────────────
