@@ -8,7 +8,7 @@ const crypto   = require('crypto')
 // ─── constants ───────────────────────────────────────────────────────────────
 
 const VIDEOS_DIR     = '/app/videos'
-const FADE           = 1.0              // seconds per side → 2s total transition
+const FADE           = 0.1           // seconds per side → 2s total transition
 const MAX_FFMPEG_MS  = 5 * 60 * 1000   // 5-minute hard timeout per ffmpeg process
 const UPLOAD_LIMIT   = 200 * 1024 * 1024 // 200 MB per file
 
