@@ -31,10 +31,43 @@ const PRESET   = 'slow'
 const PROFILE  = 'high'
 const LEVEL    = '4.1'
 const AUDIO_BR = '192k'
+const FPS      = 25
 const OUT_W    = 1920
 const OUT_H    = 1080
-const KB_W     = OUT_W  / 2   // 960
-const KB_H     = OUT_H  / 2   // 540
+const KB_W     = OUT_W / 2   // 960
+const KB_H     = OUT_H / 2   // 540
+
+// ─── breathing zoom settings ─────────────────────────────────────────────────
+//
+// The /video endpoint applies a continuous slow zoom-in/zoom-out to the still
+// image, giving the impression of gentle motion (sometimes called "Ken Burns
+// breathing").  Only two knobs to turn:
+//
+//  ZOOM_STRENGTH  – how far the zoom travels on each pulse, expressed as a
+//                   fraction of the image size.
+//                   0.04 = 4 % swing (barely perceptible, good for talking-head slides)
+//                   0.08 = 8 % swing  ← default, noticeable but not distracting
+//                   0.15 = 15% swing (dramatic; may feel restless on long clips)
+//                   Keep below 0.25 to avoid the edges of the frame being reached.
+//
+//  ZOOM_PERIOD    – seconds for one complete in → out → in cycle.
+//                   2  = fast pulse (energetic)
+//                   4  ← default, one slow breath every 4 seconds
+//                   8  = very slow drift
+//
+// The formula used is a raised cosine so it starts and ends at the minimum
+// zoom level (no visible jump at loop points):
+//
+//   z(t) = 1 + ZOOM_STRENGTH × ½ × (1 − cos(2π × t / ZOOM_PERIOD))
+//
+//   t = frame_index / FPS
+//
+//   • t = 0              → z = 1.0              (no zoom, image fits exactly)
+//   • t = ZOOM_PERIOD/2  → z = 1 + ZOOM_STRENGTH (maximum zoom-in)
+//   • t = ZOOM_PERIOD    → z = 1.0              (back to start, seamless)
+
+const ZOOM_STRENGTH = 0.08   // fractional zoom swing  (try 0.04 – 0.15)
+const ZOOM_PERIOD   = 4      // seconds per full cycle  (try 2 – 8)
 
 // ─── app setup ───────────────────────────────────────────────────────────────
 
@@ -130,16 +163,25 @@ app.post('/video', upload.fields([
     const audioDuration = getDuration(audPath)
     const totalDuration = audioDuration + 4  // 2s silence before + 2s silence after
 
-    // ── Ken Burns filter ────────────────────────────────────────────────────
+    // ── Breathing zoom filter ───────────────────────────────────────────────
     // Runs at half-res (KB_W×KB_H) for CPU efficiency, then upscales.
     // d=100000 is effectively infinite — actual length is capped by -t.
+    //
+    // Formula: z(frame) = 1 + ZOOM_STRENGTH × ½ × (1 − cos(2π × frame / cycleFrames))
+    //   • raised-cosine shape → starts and ends at minimum zoom, no jump at loops
+    //   • x/y kept centred so the zoom pulses symmetrically around the image centre
+    //
+    // Tune ZOOM_STRENGTH and ZOOM_PERIOD at the top of the file.
+    const cycleFrames = (ZOOM_PERIOD * FPS).toFixed(3)
+    const zoomExpr    = `1+${ZOOM_STRENGTH}*0.5*(1-cos(2*3.14159265*in/${cycleFrames}))`
+
     const kenBurns =
       `scale=${KB_W}:${KB_H},` +
       'zoompan=' +
-        "z='1.0+0.1*min(in/75\\,1)*(1+sin(2*3.14159265*in/75))':" +
+        `z='${zoomExpr}':` +
         "x='iw/2-(iw/zoom/2)':" +
         "y='ih/2-(ih/zoom/2)':" +
-        `d=100000:s=${KB_W}x${KB_H}:fps=25,` +
+        `d=100000:s=${KB_W}x${KB_H}:fps=${FPS},` +
       `scale=${OUT_W}:${OUT_H},` +
       // ensure dimensions are even (required by yuv420p)
       'scale=trunc(iw/2)*2:trunc(ih/2)*2'
@@ -150,7 +192,7 @@ app.post('/video', upload.fields([
       '[1:a]adelay=2000|2000,apad=pad_dur=2[a]'
 
     await ffmpeg([
-      '-loop', '1', '-framerate', '25',
+      '-loop', '1', '-framerate', String(FPS),
       '-i', imgPath,
       '-i', audPath,
       '-filter_complex', filterComplex,
